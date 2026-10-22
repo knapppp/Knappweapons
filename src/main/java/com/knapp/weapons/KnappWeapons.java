@@ -694,7 +694,7 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
             }
         }, 20L * 60);
 
-        Bukkit.getScheduler().runTask(this, p::closeInventory);
+           Bukkit.getScheduler().runTask(this, () -> p.closeInventory());
         p.sendMessage(Component.text("Type the new item name in chat, or type ", NamedTextColor.YELLOW)
                 .append(Component.text("cancel", NamedTextColor.RED))
                 .append(Component.text(".", NamedTextColor.YELLOW)));
