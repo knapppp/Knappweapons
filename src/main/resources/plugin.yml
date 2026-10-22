@@ -1,0 +1,19 @@
+name: KnappWeapons
+version: 1.0.0
+main: com.knapp.weapons.KnappWeapons
+api-version: '1.21'
+description: Give any item a custom right-click ability, cooldown and colored name.
+
+commands:
+  kweapons:
+    description: Open the KnappWeapons menu
+    usage: /kweapons
+    permission: knappweapons.admin
+
+permissions:
+  knappweapons.admin:
+    description: Use /kweapons to edit items
+    default: op
+  knappweapons.use:
+    description: Use abilities on items
+    default: true
