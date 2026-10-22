@@ -82,6 +82,18 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
     private static final int ITEM_SLOT = 13;
     private static final int MAIN_ABILITY_BTN = 11;
     private static final int MAIN_RENAME_BTN = 15;
+    private static final int MAIN_LORE_BTN = 22;
+
+    /** Default message sent in chat when an ability is used while on cooldown. %time% = time left. */
+    private static final String DEFAULT_CD_MESSAGE = "&cAbility on cooldown! &7(&e%time%&7)";
+
+    // lore menu (54 slots)
+    private static final int[] LORE_SLOTS = {10, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23, 24, 25, 28, 29, 30, 31, 32, 33, 34};
+    private static final int LORE_PREVIEW = 4;
+    private static final int LORE_BACK = 45;
+    private static final int LORE_ADD = 49;
+    private static final int LORE_CLEAR = 51;
+    private static final int LORE_HELP = 53;
 
     // ability menu (54 slots)
     private static final int[] ICON_SLOTS = {10, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22};
@@ -93,6 +105,7 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
     private static final int CD_PLUS_5 = 43;
     private static final int AB_BACK = 45;
     private static final int AB_REMOVE = 49;
+    private static final int AB_CD_MSG = 31;
 
     // rename menu (27 slots)
     private static final int REN_PREVIEW = 4;
@@ -154,7 +167,10 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
 
     // ------------------------------------------------------------------ state
 
-    enum Menu {MAIN, ABILITY, RENAME}
+    enum Menu {MAIN, ABILITY, RENAME, LORE}
+
+    /** What the player is currently typing in chat. */
+    enum Input {RENAME, LORE_ADD, LORE_EDIT, COOLDOWN_MSG}
 
     static final class MenuHolder implements InventoryHolder {
         final Menu type;
@@ -173,7 +189,8 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
     static final class Session {
         ItemStack item;
         boolean transition;
-        volatile boolean awaitingRename;
+        volatile Input awaiting;
+        int editIndex;
         BukkitTask timeout;
     }
 
@@ -181,6 +198,8 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
     private NamespacedKey cooldownKey;
     private NamespacedKey uidKey;
     private NamespacedKey loreKey;
+    private NamespacedKey cdMsgKey;
+    private final Map<UUID, Long> lastCdMessage = new HashMap<>();
 
     private final Map<UUID, Session> sessions = new ConcurrentHashMap<>();
     private final Map<String, Long> cooldowns = new HashMap<>();
@@ -195,6 +214,7 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
         cooldownKey = new NamespacedKey(this, "cooldown_ticks");
         uidKey = new NamespacedKey(this, "item_uid");
         loreKey = new NamespacedKey(this, "ability_lore_lines");
+        cdMsgKey = new NamespacedKey(this, "cooldown_message");
 
         getServer().getPluginManager().registerEvents(this, this);
         var cmd = getCommand("kweapons");
@@ -361,6 +381,47 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
         item.setItemMeta(meta);
     }
 
+    // ---- editable lore (the ability lines this plugin adds always stay at the end)
+
+    private List<Component> userLore(ItemStack item) {
+        ItemMeta meta = item.getItemMeta();
+        List<Component> lore = meta.lore() == null ? new ArrayList<>() : new ArrayList<>(meta.lore());
+        int tail = meta.getPersistentDataContainer().getOrDefault(loreKey, PersistentDataType.INTEGER, 0);
+        int n = Math.max(0, lore.size() - tail);
+        return new ArrayList<>(lore.subList(0, n));
+    }
+
+    private void setUserLore(ItemStack item, List<Component> user) {
+        ItemMeta meta = item.getItemMeta();
+        List<Component> lore = meta.lore() == null ? new ArrayList<>() : new ArrayList<>(meta.lore());
+        int tail = meta.getPersistentDataContainer().getOrDefault(loreKey, PersistentDataType.INTEGER, 0);
+        int n = Math.max(0, lore.size() - tail);
+        List<Component> out = new ArrayList<>(user);
+        out.addAll(lore.subList(n, lore.size()));
+        meta.lore(out.isEmpty() ? null : out);
+        item.setItemMeta(meta);
+    }
+
+    private Component parseLine(String input) {
+        if (input.trim().equalsIgnoreCase("[blank]")) return Component.empty();
+        return LEGACY.deserialize(input).decorationIfAbsent(TextDecoration.ITALIC, TextDecoration.State.FALSE);
+    }
+
+    // ---- cooldown message (stored on the item; empty string = disabled)
+
+    private String cooldownMessageOf(ItemStack item) {
+        if (item == null || !item.hasItemMeta()) return DEFAULT_CD_MESSAGE;
+        return item.getItemMeta().getPersistentDataContainer()
+                .getOrDefault(cdMsgKey, PersistentDataType.STRING, DEFAULT_CD_MESSAGE);
+    }
+
+    private void setCooldownMessage(ItemStack item, String message) {
+        ItemMeta meta = item.getItemMeta();
+        if (message == null) meta.getPersistentDataContainer().remove(cdMsgKey);
+        else meta.getPersistentDataContainer().set(cdMsgKey, PersistentDataType.STRING, message);
+        item.setItemMeta(meta);
+    }
+
     // ------------------------------------------------------------------ sessions
 
     /** Ends a session and gives the item back to the player. */
@@ -368,7 +429,7 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
         Session s = sessions.remove(p.getUniqueId());
         if (s == null) return;
         if (s.timeout != null) s.timeout.cancel();
-        s.awaitingRename = false;
+        s.awaiting = null;
 
         Inventory top = p.getOpenInventory().getTopInventory();
         if (top.getHolder() instanceof MenuHolder h && h.type == Menu.MAIN) {
@@ -411,10 +472,14 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
             inv.setItem(MAIN_RENAME_BTN, icon(Material.NAME_TAG, t("Rename Item", NamedTextColor.AQUA),
                     List.of(t("Click to rename with colors,", NamedTextColor.GRAY),
                             t("bold, italic and more.", NamedTextColor.GRAY))));
+            inv.setItem(MAIN_LORE_BTN, icon(Material.WRITABLE_BOOK, t("Edit Lore", NamedTextColor.GREEN),
+                    List.of(t("Add, edit and remove the lore", NamedTextColor.GRAY),
+                            t("lines shown under the item name.", NamedTextColor.GRAY))));
         } else {
             List<Component> hint = List.of(t("Place an item in the center slot first.", NamedTextColor.GRAY));
             inv.setItem(MAIN_ABILITY_BTN, icon(Material.BARRIER, t("Ability & Cooldown", NamedTextColor.DARK_GRAY), hint));
             inv.setItem(MAIN_RENAME_BTN, icon(Material.BARRIER, t("Rename Item", NamedTextColor.DARK_GRAY), hint));
+            inv.setItem(MAIN_LORE_BTN, icon(Material.BARRIER, t("Edit Lore", NamedTextColor.DARK_GRAY), hint));
         }
     }
 
@@ -458,6 +523,22 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
         inv.setItem(AB_BACK, icon(Material.ARROW, t("Back", NamedTextColor.YELLOW), null));
         inv.setItem(AB_REMOVE, icon(Material.BARRIER, t("Remove Ability", NamedTextColor.RED),
                 List.of(t("Removes the ability from this item.", NamedTextColor.GRAY))));
+
+        String msg = cooldownMessageOf(s.item);
+        List<Component> msgLore = new ArrayList<>();
+        msgLore.add(t("Sent in chat when the ability", NamedTextColor.GRAY));
+        msgLore.add(t("is used while on cooldown.", NamedTextColor.GRAY));
+        msgLore.add(Component.empty());
+        msgLore.add(t("Current:", NamedTextColor.DARK_GRAY));
+        msgLore.add(msg.isEmpty() ? t("(disabled)", NamedTextColor.RED)
+                : LEGACY.deserialize(msg.replace("%time%", "3.2s"))
+                .decorationIfAbsent(TextDecoration.ITALIC, TextDecoration.State.FALSE));
+        msgLore.add(Component.empty());
+        msgLore.add(t("Left-click: change message", NamedTextColor.YELLOW));
+        msgLore.add(t("Right-click: reset to default", NamedTextColor.YELLOW));
+        msgLore.add(t("Use %time% for the time left.", NamedTextColor.DARK_GRAY));
+        msgLore.add(t("Type 'off' in chat to disable it.", NamedTextColor.DARK_GRAY));
+        inv.setItem(AB_CD_MSG, icon(Material.OAK_SIGN, t("Cooldown Message", NamedTextColor.AQUA), msgLore));
     }
 
     private ItemStack cdButton(Material mat, String name, String left, String right) {
@@ -502,6 +583,44 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
         inv.setItem(REN_RESET, icon(Material.REDSTONE, t("Reset Name", NamedTextColor.RED),
                 List.of(t("Back to the default item name.", NamedTextColor.GRAY))));
         inv.setItem(REN_BACK, icon(Material.ARROW, t("Back", NamedTextColor.YELLOW), null));
+    }
+
+    private void openLore(Player p, Session s) {
+        MenuHolder holder = new MenuHolder(Menu.LORE);
+        Inventory inv = Bukkit.createInventory(holder, 54, Component.text("Edit Lore"));
+        holder.inventory = inv;
+        for (int i = 0; i < 54; i++) inv.setItem(i, filler());
+        renderLore(inv, s);
+        open(p, s, inv);
+    }
+
+    private void renderLore(Inventory inv, Session s) {
+        inv.setItem(LORE_PREVIEW, s.item.clone());
+        for (int slot : LORE_SLOTS) inv.setItem(slot, filler());
+
+        List<Component> lines = userLore(s.item);
+        for (int i = 0; i < lines.size() && i < LORE_SLOTS.length; i++) {
+            Component line = lines.get(i);
+            boolean blank = PlainTextComponentSerializer.plainText().serialize(line).isBlank();
+            inv.setItem(LORE_SLOTS[i], icon(Material.PAPER,
+                    blank ? t("(blank line)", NamedTextColor.DARK_GRAY) : line,
+                    List.of(t("Line " + (i + 1), NamedTextColor.DARK_GRAY),
+                            Component.empty(),
+                            t("Left-click: edit this line", NamedTextColor.YELLOW),
+                            t("Right-click: delete this line", NamedTextColor.RED))));
+        }
+
+        boolean full = lines.size() >= LORE_SLOTS.length;
+        inv.setItem(LORE_ADD, full
+                ? icon(Material.BARRIER, t("Lore is full", NamedTextColor.RED), null)
+                : icon(Material.LIME_DYE, t("Add a Line", NamedTextColor.GREEN),
+                List.of(t("Click, then type the new line in chat.", NamedTextColor.GRAY),
+                        t("Type [blank] for an empty line.", NamedTextColor.GRAY))));
+        inv.setItem(LORE_CLEAR, icon(Material.REDSTONE, t("Clear All Lore", NamedTextColor.RED),
+                List.of(t("Removes your lore lines.", NamedTextColor.GRAY),
+                        t("(The ability text is kept.)", NamedTextColor.DARK_GRAY))));
+        inv.setItem(LORE_HELP, helpBook());
+        inv.setItem(LORE_BACK, icon(Material.ARROW, t("Back", NamedTextColor.YELLOW), null));
     }
 
     private ItemStack helpBook() {
@@ -556,6 +675,48 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
                 e.setCancelled(true);
                 clickRename(e, p, s, top);
             }
+            case LORE -> {
+                e.setCancelled(true);
+                clickLore(e, p, s, top);
+            }
+        }
+    }
+
+    private void clickLore(InventoryClickEvent e, Player p, Session s, Inventory top) {
+        int raw = e.getRawSlot();
+        if (raw < 0 || raw >= top.getSize()) return;
+
+        if (raw == LORE_BACK) {
+            click(p);
+            openMain(p, s);
+            return;
+        }
+        if (raw == LORE_ADD) {
+            if (userLore(s.item).size() >= LORE_SLOTS.length) return;
+            click(p);
+            startInput(p, s, Input.LORE_ADD, -1);
+            return;
+        }
+        if (raw == LORE_CLEAR) {
+            setUserLore(s.item, new ArrayList<>());
+            click(p);
+            renderLore(top, s);
+            return;
+        }
+        for (int i = 0; i < LORE_SLOTS.length; i++) {
+            if (raw != LORE_SLOTS[i]) continue;
+            List<Component> lines = userLore(s.item);
+            if (i >= lines.size()) return;
+            if (e.isRightClick()) {
+                lines.remove(i);
+                setUserLore(s.item, lines);
+                click(p);
+                renderLore(top, s);
+            } else {
+                click(p);
+                startInput(p, s, Input.LORE_EDIT, i);
+            }
+            return;
         }
     }
 
@@ -579,6 +740,10 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
                 click(p);
                 s.item = current;
                 openRename(p, s);
+            } else if (raw == MAIN_LORE_BTN) {
+                click(p);
+                s.item = current;
+                openLore(p, s);
             }
             return;
         }
@@ -600,6 +765,16 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
                 removeAbility(s.item);
                 click(p);
                 renderAbility(top, s);
+            }
+            return;
+        }
+        if (raw == AB_CD_MSG) {
+            click(p);
+            if (e.isRightClick()) {
+                setCooldownMessage(s.item, null); // back to default
+                renderAbility(top, s);
+            } else {
+                startInput(p, s, Input.COOLDOWN_MSG, -1);
             }
             return;
         }
@@ -643,7 +818,7 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
             renderRename(top, s);
         } else if (raw == REN_TYPE) {
             click(p);
-            startRename(p, s);
+            startInput(p, s, Input.RENAME, -1);
         }
     }
 
@@ -667,7 +842,7 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
         Session s = sessions.get(p.getUniqueId());
         if (s == null) return;
         if (h.type == Menu.MAIN) s.item = normalize(e.getInventory().getItem(ITEM_SLOT));
-        if (s.transition || s.awaitingRename) return;
+        if (s.transition || s.awaiting != null) return;
         finish(p);
     }
 
@@ -679,48 +854,99 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
         cooldowns.keySet().removeIf(k -> k.startsWith(prefix));
         cloakUntil.remove(p.getUniqueId());
         noFall.remove(p.getUniqueId());
+        lastCdMessage.remove(p.getUniqueId());
     }
 
-    // ------------------------------------------------------------------ renaming via chat
+    // ------------------------------------------------------------------ chat input (rename / lore / cooldown message)
 
-    private void startRename(Player p, Session s) {
-        s.awaitingRename = true;
+    private void startInput(Player p, Session s, Input input, int index) {
+        s.awaiting = input;
+        s.editIndex = index;
+        if (s.timeout != null) s.timeout.cancel();
         s.timeout = Bukkit.getScheduler().runTaskLater(this, () -> {
-            if (s.awaitingRename && sessions.get(p.getUniqueId()) == s) {
+            if (s.awaiting != null && sessions.get(p.getUniqueId()) == s) {
                 finish(p);
                 if (p.isOnline()) {
-                    p.sendMessage(Component.text("Rename timed out. Your item was returned.", NamedTextColor.RED));
+                    p.sendMessage(Component.text("Timed out. Your item was returned.", NamedTextColor.RED));
                 }
             }
         }, 20L * 60);
 
-           Bukkit.getScheduler().runTask(this, () -> p.closeInventory());
-        p.sendMessage(Component.text("Type the new item name in chat, or type ", NamedTextColor.YELLOW)
+        Bukkit.getScheduler().runTask(this, () -> p.closeInventory());
+
+        String prompt = switch (input) {
+            case RENAME -> "Type the new item name in chat";
+            case LORE_ADD -> "Type the new lore line in chat";
+            case LORE_EDIT -> "Type the new text for lore line " + (index + 1) + " in chat";
+            case COOLDOWN_MSG -> "Type the new cooldown message in chat";
+        };
+        p.sendMessage(Component.text(prompt + ", or type ", NamedTextColor.YELLOW)
                 .append(Component.text("cancel", NamedTextColor.RED))
                 .append(Component.text(".", NamedTextColor.YELLOW)));
         p.sendMessage(Component.text("Colors: &0-&f   Bold: &l   Italic: &o   Underline: &n   Strike: &m   "
                 + "Magic: &k   Reset: &r   Hex: &#RRGGBB", NamedTextColor.GRAY));
+        if (input == Input.COOLDOWN_MSG) {
+            p.sendMessage(Component.text("Use %time% for the time left. Type 'off' to disable the message, "
+                    + "or 'default' to reset it.", NamedTextColor.GRAY));
+        } else if (input != Input.RENAME) {
+            p.sendMessage(Component.text("Type [blank] for an empty line.", NamedTextColor.GRAY));
+        }
     }
 
     @EventHandler
     public void onChat(AsyncChatEvent e) {
         Player p = e.getPlayer();
         Session s = sessions.get(p.getUniqueId());
-        if (s == null || !s.awaitingRename) return;
+        if (s == null || s.awaiting == null) return;
         e.setCancelled(true);
         String message = PlainTextComponentSerializer.plainText().serialize(e.message());
-        Bukkit.getScheduler().runTask(this, () -> handleRenameInput(p, message));
+        Bukkit.getScheduler().runTask(this, () -> handleInput(p, message));
     }
 
-    private void handleRenameInput(Player p, String message) {
+    private void handleInput(Player p, String message) {
         Session s = sessions.get(p.getUniqueId());
-        if (s == null || !s.awaitingRename || s.item == null) return;
-        s.awaitingRename = false;
+        if (s == null || s.awaiting == null || s.item == null) return;
+        Input input = s.awaiting;
+        s.awaiting = null;
         if (s.timeout != null) s.timeout.cancel();
-        if (!message.trim().equalsIgnoreCase("cancel") && !message.isBlank()) {
-            renameItem(s.item, message);
+
+        boolean cancel = message.isBlank() || message.trim().equalsIgnoreCase("cancel");
+
+        switch (input) {
+            case RENAME -> {
+                if (!cancel) renameItem(s.item, message);
+                openRename(p, s);
+            }
+            case LORE_ADD -> {
+                if (!cancel) {
+                    List<Component> lines = userLore(s.item);
+                    if (lines.size() < LORE_SLOTS.length) {
+                        lines.add(parseLine(message));
+                        setUserLore(s.item, lines);
+                    }
+                }
+                openLore(p, s);
+            }
+            case LORE_EDIT -> {
+                if (!cancel) {
+                    List<Component> lines = userLore(s.item);
+                    if (s.editIndex >= 0 && s.editIndex < lines.size()) {
+                        lines.set(s.editIndex, parseLine(message));
+                        setUserLore(s.item, lines);
+                    }
+                }
+                openLore(p, s);
+            }
+            case COOLDOWN_MSG -> {
+                if (!cancel) {
+                    String m = message.trim();
+                    if (m.equalsIgnoreCase("off")) setCooldownMessage(s.item, "");
+                    else if (m.equalsIgnoreCase("default")) setCooldownMessage(s.item, null);
+                    else setCooldownMessage(s.item, message);
+                }
+                openAbility(p, s);
+            }
         }
-        openRename(p, s);
     }
 
     // ------------------------------------------------------------------ using abilities
@@ -750,7 +976,9 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
         long now = System.currentTimeMillis();
         Long readyAt = cooldowns.get(key);
         if (readyAt != null && now < readyAt) {
-            p.playSound(p.getLocation(), Sound.ENTITY_VILLAGER_NO, 0.3f, 1.4f); // silent feedback, no text
+            p.playSound(p.getLocation(), Sound.ENTITY_VILLAGER_NO, 0.3f, 1.4f);
+            sendCooldownMessage(p, pdc.getOrDefault(cdMsgKey, PersistentDataType.STRING, DEFAULT_CD_MESSAGE),
+                    readyAt - now, now);
             return;
         }
 
@@ -758,6 +986,17 @@ public final class KnappWeapons extends JavaPlugin implements Listener, CommandE
             p.swingMainHand();
             if (cdTicks > 0) cooldowns.put(key, now + cdTicks * 50L);
         }
+    }
+
+    /** Chat message shown when an ability is used on cooldown (at most once per second per player). */
+    private void sendCooldownMessage(Player p, String template, long remainingMs, long now) {
+        if (template.isEmpty()) return; // disabled for this item
+        Long last = lastCdMessage.get(p.getUniqueId());
+        if (last != null && now - last < 1000L) return;
+        lastCdMessage.put(p.getUniqueId(), now);
+
+        String time = String.format(Locale.US, "%.1fs", Math.max(0, remainingMs) / 1000.0);
+        p.sendMessage(LEGACY.deserialize(template.replace("%time%", time)));
     }
 
     @EventHandler(ignoreCancelled = true)
